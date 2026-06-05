@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+
+# rembg model cache
+u2net/
+*.onnx
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Output / working data — don't commit actual images
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+
+# Debug folders
+debug/
+debug_det/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
