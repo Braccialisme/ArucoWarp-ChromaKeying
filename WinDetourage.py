@@ -19,7 +19,7 @@ BLUE_S_MIN = 150
 
 
 def chroma_key_hsv(img_bgr, h_min=BLUE_H_MIN, h_max=BLUE_H_MAX, s_min=BLUE_S_MIN,
-                   feather=3, grow=2):
+                   feather=3, grow=0):
     """
     HSV chroma key cutout based on blue background saturation.
     Works on all object types regardless of their color.
@@ -33,7 +33,9 @@ def chroma_key_hsv(img_bgr, h_min=BLUE_H_MIN, h_max=BLUE_H_MAX, s_min=BLUE_S_MIN
                             np.array([h_min, s_min, 0]),
                             np.array([h_max, 255, 255]))
 
-    # Grow (dilate) the mask to eat blue fringing on edges
+    # Optional: grow the mask by `grow` px to nibble a blue halo off the edges.
+    # OFF by default (grow=0) because dilation eats into the object — turn it up
+    # only if a thin blue rim bothers you.
     if grow > 0:
         kernel = np.ones((grow * 2 + 1, grow * 2 + 1), np.uint8)
         blue_mask = cv2.dilate(blue_mask, kernel, iterations=1)
@@ -50,6 +52,105 @@ def chroma_key_hsv(img_bgr, h_min=BLUE_H_MIN, h_max=BLUE_H_MAX, s_min=BLUE_S_MIN
     rgba = np.dstack([img_rgb, alpha])
 
     return Image.fromarray(rgba.astype(np.uint8))
+
+
+# =====================================================================
+# SMART MODE  — for maquettes that CONTAIN blue/teal paint
+# ---------------------------------------------------------------------
+# Pure colour keying can't tell plate-blue from painted-blue (shutters,
+# teal washes, blue speckles) because they share the same HSV slice.
+# This mode adds a SHAPE prior:
+#   1. auto-calibrate the plate colour from the image corners
+#   2. flood the background inward from the border through plate-coloured px
+#   3. anything the flood never reaches = object (kept), incl. enclosed
+#      blue paint (shutters, speckles) and dark foliage
+# ---------------------------------------------------------------------
+# No morphological "close" is used, so dark teal foliage is NOT bridged
+# into the plate and can't be bleached out. Only blue that is actually
+# connected to the outside background is removed.
+# =====================================================================
+def _bluish(hue_med):
+    return 80 <= hue_med <= 135
+
+
+def chroma_key_smart(img_bgr, h_min=BLUE_H_MIN, h_max=BLUE_H_MAX, s_min=BLUE_S_MIN,
+                     grow=3, feather=3, plate_frac=0.002,
+                     autocal=True, corner=0.05):
+    """
+    Border-flood cutout. Removes ONLY blue that is connected to the outside
+    background; keeps every enclosed blue/teal area (painted shutters, skies,
+    water, foliage shadow). Returns RGBA PIL image.
+
+    autocal : sample the four corners (assumed background) and widen the
+              H/S window to whatever the plate actually is on THIS image.
+              Corners that don't look bluish are ignored, so a leg or tree
+              touching a corner won't poison the calibration.
+    grow    : dilate the plate mask by this many px to swallow blue fringing
+              at the object edge (helps the "missed spots").
+    """
+    h, w = img_bgr.shape[:2]
+    frame = h * w
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    # 1) auto-calibrate plate colour from bluish corners ----------------
+    if autocal:
+        cs = max(4, int(min(h, w) * corner))
+        patches = [hsv[:cs, :cs], hsv[:cs, -cs:], hsv[-cs:, :cs], hsv[-cs:, -cs:]]
+        good = []
+        for p in patches:
+            f = p.reshape(-1, 3).astype(np.float32)
+            hm, sm = np.median(f[:, 0]), np.median(f[:, 1])
+            # only a saturated, blue-ish corner is trusted as plate
+            if _bluish(hm) and sm > 90:
+                good.append(f)
+        if good:
+            samp = np.concatenate(good, 0)
+            H, S = samp[:, 0], samp[:, 1]
+            # widen, but clamp so a noisy corner can't blow the window open
+            h_min = int(np.clip(min(h_min, np.percentile(H, 2)), 80, h_min))
+            h_max = int(np.clip(max(h_max, np.percentile(H, 98)), h_max, 135))
+            s_min = int(max(80, min(s_min, np.percentile(S, 10) - 10)))
+
+    # 2) plate-coloured mask -------------------------------------------
+    blue = cv2.inRange(hsv,
+                       np.array([h_min, s_min, 0]),
+                       np.array([h_max, 255, 255]))
+    if grow > 0:
+        k = np.ones((grow * 2 + 1, grow * 2 + 1), np.uint8)
+        blue = cv2.dilate(blue, k, iterations=1)
+    _, bm = cv2.threshold(blue, 127, 255, cv2.THRESH_BINARY)
+
+    # 3) background = plate components that TOUCH the border ------------
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(bm, 8)
+    border = set(lab[0, :]).union(lab[-1, :]).union(lab[:, 0]).union(lab[:, -1])
+    border.discard(0)
+    bg = np.isin(lab, list(border)).astype(np.uint8) * 255
+
+    # augment with any very-large plate pocket that got cut off from the
+    # border by the object (keeps the arch opening transparent) ---------
+    thr = plate_frac * frame
+    for i in range(1, n):
+        if i not in border and stats[i, cv2.CC_STAT_AREA] >= thr:
+            bg[lab == i] = 255
+
+    # guards: if the flood found nothing (border wasn't plate) fall back
+    # to size; if it ate almost everything, bail to plain colour key ----
+    cov = bg.mean() / 255.0
+    if cov < 0.01:
+        bg = np.zeros_like(bm)
+        for i in range(1, n):
+            if stats[i, cv2.CC_STAT_AREA] >= thr:
+                bg[lab == i] = 255
+    elif cov > 0.9:
+        return chroma_key_hsv(img_bgr, h_min, h_max, s_min)
+
+    alpha = 255 - bg
+    if feather > 0:
+        alpha = cv2.GaussianBlur(alpha, (feather * 2 + 1, feather * 2 + 1), 0)
+
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    rgba = np.dstack([img_rgb, alpha]).astype(np.uint8)
+    return Image.fromarray(rgba)
 
 
 def fill_interior_holes(img_pil, min_area=5000):
@@ -90,7 +191,9 @@ def fill_interior_holes(img_pil, min_area=5000):
 
 
 def remove_color_spill(img_pil, strength=0.4):
-    """Removes blue reflection/spill on object edges"""
+    """Removes blue reflection/spill on object edges.
+    NOTE: this dulls genuinely blue PAINT too. Keep strength low (or 0) on
+    blue-heavy artworks, or the shutters/skies lose their blue."""
     arr = np.array(img_pil).astype(float)
     # Reduce blue where it dominates
     blue_excess = np.maximum(0, arr[:, :, 2] - np.maximum(arr[:, :, 0], arr[:, :, 1]))
@@ -111,12 +214,15 @@ def process_with_rembg(img_bgr):
 
 
 def process_image(input_path, output_path, mode='auto', debug=False,
-                  h_min=BLUE_H_MIN, h_max=BLUE_H_MAX, s_min=BLUE_S_MIN):
+                  h_min=BLUE_H_MIN, h_max=BLUE_H_MAX, s_min=BLUE_S_MIN,
+                  close_px=3, plate_frac=0.002, spill=0.0, grow=0):
     """
     Processes an image with optimized cutout.
 
     Modes:
         auto     : HSV chroma key (recommended for most cases)
+        smart    : silhouette + plate-carve (for maquettes containing
+                   blue/teal PAINT — shutters, skies, water, etc.)
         rembg    : rembg only (for very complex/intricate shapes)
         combined : chroma key + rembg combined
     """
@@ -141,10 +247,23 @@ def process_image(input_path, output_path, mode='auto', debug=False,
             print(f"   ❌ rembg failed")
             return None
 
+    elif mode == 'smart':
+        print(f"   🧠 Smart border-flood "
+              f"(H:{h_min}-{h_max}, S>{s_min}, grow={close_px}, autocal on)...")
+        result = chroma_key_smart(img_bgr, h_min, h_max, s_min,
+                                  grow=close_px, plate_frac=plate_frac)
+        if debug:
+            result.save(os.path.join(debug_dir, f"{name}_02_smart.png"))
+        # smart already isolates the background cleanly; skip hole-fill,
+        # and skip spill (it would dull the legit blue paint)
+        result.save(output_path)
+        print(f"   ✅ {output_path}")
+        return result
+
     elif mode == 'combined':
         # Chroma key first
         print(f"   🔵 HSV Chroma key...")
-        result = chroma_key_hsv(img_bgr, h_min, h_max, s_min)
+        result = chroma_key_hsv(img_bgr, h_min, h_max, s_min, grow=grow)
 
         if debug:
             result.save(os.path.join(debug_dir, f"{name}_01_chroma.png"))
@@ -160,9 +279,9 @@ def process_image(input_path, output_path, mode='auto', debug=False,
             arr_chroma[:, :, 3] = alpha_combined
             result = Image.fromarray(arr_chroma)
 
-    else:  # auto (default)
-        print(f"   🔵 HSV Chroma key (H:{h_min}-{h_max}, S>{s_min})...")
-        result = chroma_key_hsv(img_bgr, h_min, h_max, s_min)
+    else:  # auto (default) — plain, conservative chroma key
+        print(f"   🔵 HSV Chroma key (H:{h_min}-{h_max}, S>{s_min}, grow={grow})...")
+        result = chroma_key_hsv(img_bgr, h_min, h_max, s_min, grow=grow)
 
     if debug:
         result.save(os.path.join(debug_dir, f"{name}_02_chroma.png"))
@@ -175,8 +294,9 @@ def process_image(input_path, output_path, mode='auto', debug=False,
         result.save(os.path.join(debug_dir, f"{name}_03_filled.png"))
 
     # Color spill correction
-    print(f"   ✨ Color spill correction...")
-    result = remove_color_spill(result, strength=0.4)
+    if spill > 0:
+        print(f"   ✨ Color spill correction...")
+        result = remove_color_spill(result, strength=spill)
 
     # Save
     result.save(output_path)
@@ -187,8 +307,9 @@ def process_image(input_path, output_path, mode='auto', debug=False,
 
 def main():
     parser = argparse.ArgumentParser(description='HSV chroma key cutout')
-    parser.add_argument('--mode', choices=['auto', 'rembg', 'combined'], default='auto',
-                        help='auto=HSV chroma key, rembg=AI only, combined=both')
+    parser.add_argument('--mode', choices=['auto', 'smart', 'rembg', 'combined'], default='auto',
+                        help='auto=HSV chroma key, smart=silhouette+plate-carve (blue-heavy art), '
+                             'rembg=AI only, combined=both')
     parser.add_argument('--debug', action='store_true',
                         help='Save intermediate steps')
     parser.add_argument('--shoot', default=SHOOT_NAME,
@@ -201,6 +322,14 @@ def main():
                         help=f'Blue background hue maximum (default: {BLUE_H_MAX})')
     parser.add_argument('--s-min', type=int, default=BLUE_S_MIN,
                         help=f'Blue background saturation minimum (default: {BLUE_S_MIN})')
+    parser.add_argument('--close', type=int, default=3,
+                        help='[smart] edge grow in px to swallow blue fringing (default: 3)')
+    parser.add_argument('--plate-frac', type=float, default=0.002,
+                        help='[smart] min area fraction for a blue blob to count as plate (default: 0.002)')
+    parser.add_argument('--spill', type=float, default=0.0,
+                        help='blue spill removal strength (0 = off, keeps colours intact; default: 0)')
+    parser.add_argument('--grow', type=int, default=0,
+                        help='[auto] grow the cut by N px to trim a blue halo (0 = safest; default: 0)')
 
     args = parser.parse_args()
 
@@ -241,7 +370,9 @@ def main():
         try:
             result = process_image(input_path, output_path,
                                    mode=args.mode, debug=args.debug,
-                                   h_min=args.h_min, h_max=args.h_max, s_min=args.s_min)
+                                   h_min=args.h_min, h_max=args.h_max, s_min=args.s_min,
+                                   close_px=args.close, plate_frac=args.plate_frac,
+                                   spill=args.spill, grow=args.grow)
             if result:
                 ok += 1
             else:
@@ -253,10 +384,11 @@ def main():
         print("-" * 50)
 
     print(f"\n🎯 DONE — ✅ {ok} OK  ❌ {fail} failed")
-    print(f"\n💡 If some images fail:")
-    print(f"   Light/grey object eaten  → python WinDetourage.py --s-min 120")
-    print(f"   Residual blue inside     → python WinDetourage.py --mode combined")
-    print(f"   Very complex shape       → python WinDetourage.py --mode rembg")
+    print(f"\n💡 Tuning (auto stays safe — it never grows into the object):")
+    print(f"   Too much plate left      → raise S MIN a little  (--s-min 130)")
+    print(f"   Object edge eaten        → lower S MIN            (--s-min 170)")
+    print(f"   Thin blue halo on edges  → add a touch of grow    (--grow 1)")
+    print(f"   Colours look dulled      → keep spill off          (--spill 0, the default)")
 
 
 if __name__ == "__main__":
