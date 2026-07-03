@@ -8,6 +8,38 @@ import os
 SHOOT_NAME = "BMO_MAQ_255_Wagner_La_Walkyrie_1893"  # ← Just change this line between shoots!
 use_perspective = True  # True for perspective, False for affine (less distortion but no perspective correction)
 
+
+def find_input_dir(base_path):
+    """
+    Shoots now come in two flavours:
+      base_path/input/JPG/*.jpg   ← new convention (students send local files)
+      base_path/input/*.jpg       ← legacy convention
+
+    Tries the new convention first, then falls back, then does a shallow
+    recursive search as a last resort so odd folder names don't block a run.
+    """
+    candidates = [
+        os.path.join(base_path, "input", "JPG"),
+        os.path.join(base_path, "input", "jpg"),
+        os.path.join(base_path, "input"),
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            files = [f for f in os.listdir(c) if f.lower().endswith(('.jpg', '.jpeg'))]
+            if files:
+                return c, files
+
+    # Last resort: shallow recursive search under base_path/input
+    input_root = os.path.join(base_path, "input")
+    if os.path.isdir(input_root):
+        for root, _dirs, filenames in os.walk(input_root):
+            files = [f for f in filenames if f.lower().endswith(('.jpg', '.jpeg'))]
+            if files:
+                return root, files
+
+    return None, []
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Perspective unwrap via ArUco markers')
@@ -24,7 +56,6 @@ def main():
         shoot_name = args.shoot
         base_path  = r"\\horus\JOBS\France\OperaParis_MaquettesDecors\2026-02\01-Data\Images_Originals\Maquettes\Models" + "\\" + shoot_name
 
-    input_dir  = os.path.join(base_path, "input")
     output_dir = os.path.join(base_path, "output")
     debug_dir  = os.path.join(base_path, "debug")
 
@@ -35,18 +66,17 @@ def main():
         print(f"Folder {base_path} does not exist!")
         return
 
-    if not os.path.exists(input_dir):
-        print(f"Input folder does not exist in {base_path}")
+    input_dir, filenames = find_input_dir(base_path)
+    if input_dir is None:
+        print(f"No JPG images found. Tried:")
+        print(f"   {os.path.join(base_path, 'input', 'JPG')}")
+        print(f"   {os.path.join(base_path, 'input')}")
         return
 
-    image_paths = [os.path.join(input_dir, f) for f in os.listdir(input_dir)
-                   if f.lower().endswith('.jpg')]
-
-    if not image_paths:
-        print(f"No JPG images found in {input_dir}")
-        return
+    image_paths = sorted(os.path.join(input_dir, f) for f in filenames)
 
     print(f"Shoot: {shoot_name}")
+    print(f"Source: {input_dir}")
     print(f"{len(image_paths)} images found")
 
     process_all(image_paths, output_dir, debug_dir, use_perspective=use_perspective)
