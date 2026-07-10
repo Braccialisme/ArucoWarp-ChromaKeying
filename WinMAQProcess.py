@@ -131,6 +131,8 @@ class App(tk.Tk):
         self._h_min      = tk.IntVar(value=95)
         self._h_max      = tk.IntVar(value=115)
         self._s_min      = tk.IntVar(value=150)
+        self._despill    = tk.BooleanVar(value=True)
+        self._rim        = tk.IntVar(value=3)
         self._running    = False
 
         self._build_ui()
@@ -227,6 +229,15 @@ class App(tk.Tk):
         self._slider(sliders, "H MIN", self._h_min, 0, 180, 0)
         self._slider(sliders, "H MAX", self._h_max, 0, 180, 1)
         self._slider(sliders, "S MIN", self._s_min, 0, 255, 2)
+        self._slider(sliders, "RIM PX", self._rim, 0, 12, 3)
+
+        despill_row = tk.Frame(c3, bg=CARD)
+        despill_row.pack(fill="x", pady=(12, 0))
+        self._toggle(despill_row, "Despill  (remove blue edge fringe, keeps paint)",
+                     self._despill).pack(side="left")
+        tk.Label(despill_row,
+                 text="[auto/combined] rim-only, so interior colours stay saturated",
+                 font=F_SMALL, bg=CARD, fg=DIM).pack(side="left", padx=(14, 0))
 
         # ── Run row
         run_row = tk.Frame(outer, bg=BG)
@@ -472,6 +483,8 @@ class App(tk.Tk):
             "--h-min",     str(self._h_min.get()),
             "--h-max",     str(self._h_max.get()),
             "--s-min",     str(self._s_min.get()),
+            "--rim-px",    str(self._rim.get()),
+            "--despill" if self._despill.get() else "--no-despill",
         ])
 
         if ok:
@@ -512,6 +525,8 @@ class App(tk.Tk):
                 "--h-min",     str(self._h_min.get()),
                 "--h-max",     str(self._h_max.get()),
                 "--s-min",     str(self._s_min.get()),
+                "--rim-px",    str(self._rim.get()),
+                "--despill" if self._despill.get() else "--no-despill",
             ])
             if not ok:
                 self._log("Detourage failed.", "error")

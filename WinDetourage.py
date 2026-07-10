@@ -385,6 +385,11 @@ def main():
                         help='blue spill removal strength (0 = off, keeps colours intact; default: 0)')
     parser.add_argument('--grow', type=int, default=0,
                         help='[auto] grow the cut by N px to trim a blue halo (0 = safest; default: 0)')
+    parser.add_argument('--despill', action=argparse.BooleanOptionalAction, default=True,
+                        help='[auto/combined] remove blue fringe on a thin edge rim only '
+                             '(keeps interior paint saturated). Use --no-despill to disable.')
+    parser.add_argument('--rim-px', type=int, default=3,
+                        help='[auto/combined] width in px of the despill rim (default: 3)')
 
     args = parser.parse_args()
 
@@ -427,7 +432,8 @@ def main():
                                    mode=args.mode, debug=args.debug,
                                    h_min=args.h_min, h_max=args.h_max, s_min=args.s_min,
                                    close_px=args.close, plate_frac=args.plate_frac,
-                                   spill=args.spill, grow=args.grow)
+                                   spill=args.spill, grow=args.grow,
+                                   despill=args.despill, rim_px=args.rim_px)
             if result:
                 ok += 1
             else:
