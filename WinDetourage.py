@@ -18,40 +18,91 @@ BLUE_H_MAX = 115
 BLUE_S_MIN = 150
 
 
+def _smoothstep(x, lo, hi):
+    """Elementwise 0→1 cubic ramp: 0 at/below lo, 1 at/above hi, smooth between.
+    Gives anti-aliased transitions without a spatial blur."""
+    if hi <= lo:
+        return (x >= hi).astype(np.float32)
+    t = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+    return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+
+
+# Soft-key falloff tuning. Wider = softer/more forgiving edge; narrower = crisper.
+HUE_MARGIN = 12.0   # degrees past the plate hue window where alpha reaches 1
+SAT_BAND   = 40.0   # saturation ramp width below s_min
+
+
 def chroma_key_hsv(img_bgr, h_min=BLUE_H_MIN, h_max=BLUE_H_MAX, s_min=BLUE_S_MIN,
-                   feather=3, grow=0):
+                   feather=1, grow=0, despill=True, rim_px=3):
     """
-    HSV chroma key cutout based on blue background saturation.
-    Works on all object types regardless of their color.
+    Saturation-preserving SOFT blue-screen key.
 
-    Returns: RGBA PIL image
+    The old version thresholded the blue plate with a hard `inRange`, then blurred
+    that binary mask with a Gaussian and set alpha = 255 - blur. Three problems
+    fell out of that: (1) the blur spread plate-blue inward from both sides of a
+    thin strut and collapsed its alpha — thin pieces got eaten; (2) blurring a
+    hard mask smears the edge instead of anti-aliasing it; (3) the semi-transparent
+    blue-tinted halo washed fine pieces out ("desaturated").
+
+    This version computes alpha as a CONTINUOUS function of each pixel's colour —
+    how close its hue is to the plate AND how saturated it is — so:
+      • thin struts keep full alpha (the decision is per-pixel colour, not a
+        spatial blur across the object);
+      • edges are anti-aliased by the soft ramp itself, not smeared;
+      • despill only touches a thin RIM around the silhouette (hue-agnostic), so
+        a blue fringe disappears WITHOUT desaturating genuine blue paint in the
+        object interior.
+
+    Returns: RGBA PIL image.
     """
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    Hc, Sc = hsv[:, :, 0], hsv[:, :, 1]
 
-    # Blue background mask
-    blue_mask = cv2.inRange(hsv,
-                            np.array([h_min, s_min, 0]),
-                            np.array([h_max, 255, 255]))
+    # Circular hue distance from the centre of the plate hue window (OpenCV hue
+    # is 0..179 and wraps around).
+    h_center = (h_min + h_max) * 0.5
+    h_half   = max(1.0, (h_max - h_min) * 0.5)
+    dh = np.abs(Hc - h_center)
+    dh = np.minimum(dh, 180.0 - dh)
 
-    # Optional: grow the mask by `grow` px to nibble a blue halo off the edges.
-    # OFF by default (grow=0) because dilation eats into the object — turn it up
-    # only if a thin blue rim bothers you.
+    # "background-ness" in 0..1: in-hue AND saturated => plate. Soft ramps give
+    # anti-aliased edges with no blur.
+    hue_bg = 1.0 - _smoothstep(dh, h_half, h_half + HUE_MARGIN)
+    sat_bg = _smoothstep(Sc, float(s_min) - SAT_BAND, float(s_min))
+    bg = hue_bg * sat_bg                      # 1 = plate, 0 = object
+
+    # Optional grow: bias toward removing a thin blue halo by max-filtering the
+    # background score. OFF by default; unlike the old symmetric dilation of a
+    # binary mask it can still nibble, so keep it small.
     if grow > 0:
-        kernel = np.ones((grow * 2 + 1, grow * 2 + 1), np.uint8)
-        blue_mask = cv2.dilate(blue_mask, kernel, iterations=1)
+        k = np.ones((grow * 2 + 1, grow * 2 + 1), np.uint8)
+        bg = cv2.dilate(bg, k, iterations=1)
 
-    # Feathering for soft edges
+    alpha = np.clip(1.0 - bg, 0.0, 1.0)
+
+    # Optional light anti-alias, confined to the transition BAND so it never
+    # touches solid interior or full background — no thin-eating, no wash.
     if feather > 0:
-        blue_mask = cv2.GaussianBlur(blue_mask, (feather * 2 + 1, feather * 2 + 1), 0)
+        band    = ((alpha > 0.02) & (alpha < 0.98)).astype(np.float32)
+        blurred = cv2.GaussianBlur(alpha, (feather * 2 + 1, feather * 2 + 1), 0)
+        alpha   = alpha * (1.0 - band) + blurred * band
 
-    # Alpha = inverse of blue mask
-    alpha = 255 - blue_mask
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
 
-    # Assemble RGBA
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    rgba = np.dstack([img_rgb, alpha])
+    # Despill: pull blue down to the fringe ONLY on a thin rim just inside the
+    # silhouette. Hue-agnostic and spatially local, so blue PAINT away from the
+    # edge keeps its full saturation (fixes the "desaturated" complaint while
+    # still removing the blue edge halo).
+    if despill and rim_px > 0:
+        keep = (alpha > 0.5).astype(np.uint8)
+        er   = cv2.erode(keep, np.ones((rim_px * 2 + 1, rim_px * 2 + 1), np.uint8))
+        rim  = ((keep == 1) & (er == 0)).astype(np.float32)
+        rim  = cv2.GaussianBlur(rim, (rim_px * 2 + 1, rim_px * 2 + 1), 0)
+        b_lim = np.minimum(img_rgb[:, :, 2], np.maximum(img_rgb[:, :, 0], img_rgb[:, :, 1]))
+        img_rgb[:, :, 2] = img_rgb[:, :, 2] * (1.0 - rim) + b_lim * rim
 
-    return Image.fromarray(rgba.astype(np.uint8))
+    rgba = np.dstack([img_rgb, alpha * 255.0]).astype(np.uint8)
+    return Image.fromarray(rgba)
 
 
 # =====================================================================
@@ -215,7 +266,8 @@ def process_with_rembg(img_bgr):
 
 def process_image(input_path, output_path, mode='auto', debug=False,
                   h_min=BLUE_H_MIN, h_max=BLUE_H_MAX, s_min=BLUE_S_MIN,
-                  close_px=3, plate_frac=0.002, spill=0.0, grow=0):
+                  close_px=3, plate_frac=0.002, spill=0.0, grow=0,
+                  despill=True, rim_px=3):
     """
     Processes an image with optimized cutout.
 
@@ -263,7 +315,8 @@ def process_image(input_path, output_path, mode='auto', debug=False,
     elif mode == 'combined':
         # Chroma key first
         print(f"   🔵 HSV Chroma key...")
-        result = chroma_key_hsv(img_bgr, h_min, h_max, s_min, grow=grow)
+        result = chroma_key_hsv(img_bgr, h_min, h_max, s_min, grow=grow,
+                                despill=despill, rim_px=rim_px)
 
         if debug:
             result.save(os.path.join(debug_dir, f"{name}_01_chroma.png"))
@@ -280,8 +333,10 @@ def process_image(input_path, output_path, mode='auto', debug=False,
             result = Image.fromarray(arr_chroma)
 
     else:  # auto (default) — plain, conservative chroma key
-        print(f"   🔵 HSV Chroma key (H:{h_min}-{h_max}, S>{s_min}, grow={grow})...")
-        result = chroma_key_hsv(img_bgr, h_min, h_max, s_min, grow=grow)
+        print(f"   🔵 HSV Chroma key (H:{h_min}-{h_max}, S>{s_min}, grow={grow}, "
+              f"despill={'on' if despill else 'off'})...")
+        result = chroma_key_hsv(img_bgr, h_min, h_max, s_min, grow=grow,
+                                despill=despill, rim_px=rim_px)
 
     if debug:
         result.save(os.path.join(debug_dir, f"{name}_02_chroma.png"))
@@ -384,11 +439,13 @@ def main():
         print("-" * 50)
 
     print(f"\n🎯 DONE — ✅ {ok} OK  ❌ {fail} failed")
-    print(f"\n💡 Tuning (auto stays safe — it never grows into the object):")
-    print(f"   Too much plate left      → raise S MIN a little  (--s-min 130)")
-    print(f"   Object edge eaten        → lower S MIN            (--s-min 170)")
-    print(f"   Thin blue halo on edges  → add a touch of grow    (--grow 1)")
-    print(f"   Colours look dulled      → keep spill off          (--spill 0, the default)")
+    print(f"\n💡 Tuning (auto is a soft colour key — it never blurs into the object):")
+    print(f"   Too much plate left      : lower S MIN a little  (--s-min 130)")
+    print(f"   Object edge eaten        : raise S MIN           (--s-min 170)")
+    print(f"   Blue fringe on edges     : despill is on by default; it only")
+    print(f"                              touches a thin rim, so paint is safe")
+    print(f"   Colours look dulled      : leave --spill 0 (legacy global despill,")
+    print(f"                              off by default; the rim despill handles it)")
 
 
 if __name__ == "__main__":
